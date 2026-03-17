@@ -37,3 +37,5 @@ target_link_libraries(test_astar Eigen3::Eigen  ${OpenCV_LIBS})
 add_executable(test_opt src/test_opt.cpp)
 target_link_libraries(test_opt Eigen3::Eigen  ${OpenCV_LIBS})
 
+add_executable(test_backend src/test_backend.cpp)
+target_link_libraries(test_backend Eigen3::Eigen)

@@ -24,21 +24,27 @@
 
 #include "astar.hpp"
 #include "grid_map.hpp"
+#include "grid_map_env.hpp"
 #include "traj_opt.hpp"
 #include <iostream>
 #include <opencv2/opencv.hpp>
 #include <memory>
 #include <chrono>
+#include <cstdlib>
 
 // Visualize path planning results
 void visualize(const grid_map::GridMap& map,
               const std::vector<Eigen::Vector2d>& path,
               const Eigen::Vector2d& start,
               const Eigen::Vector2d& goal,
+              const std::string& output_path,
+              bool show_window,
               double viz_size = 30.0,
               const std::string& window_name = "Path Planning");
 
-int main() {
+int main(int argc, char** argv) {
+    const bool show_window = argc > 1 && std::string(argv[1]) == "--show";
+
     // ==================== 1. Initialize Local Map ====================
     auto map = std::make_shared<grid_map::GridMap>();
     const double map_size = 20.0;
@@ -95,7 +101,8 @@ int main() {
     // End timing
     auto end_time = std::chrono::high_resolution_clock::now();
 
-    visualize(*map, astar_traj.optimized_path, start, goal, 40.0, "A* Optimized Path");
+    visualize(*map, astar_traj.optimized_path, start, goal,
+              "astar_optimized_path.png", show_window, 40.0, "A* Optimized Path");
 
     // ==================== 5. Trajectory Optimization ====================
     TrajOpt::TrajectoryParams params;
@@ -103,9 +110,10 @@ int main() {
     params.total_time = astar_traj.total_time;
     params.total_len = astar_traj.total_length;
 
+    auto env = std::make_shared<TrajOpt::GridMapEnv>(map);
     TrajOpt::TrajectoryOptimizer optimizer(
-        map,
         astar_traj.optimized_path,
+        env,
         params
     );
 
@@ -120,6 +128,7 @@ int main() {
     auto metrics = optimizer.evaluateTrajectory();
     std::cout << "\n=== Optimization Metrics ===" << std::endl;
     std::cout << "Max velocity: " << metrics.max_velocity << " m/s" << std::endl;
+    std::cout << "Max acceleration: " << metrics.max_acceleration << " m/s^2" << std::endl;
     std::cout << "Min clearance: " << metrics.min_clearance << " m" << std::endl;
     std::cout << "Path deviation: " << metrics.path_deviation << " m" << std::endl;
     std::cout << "Trajectory energy: " << metrics.trajectory_energy << std::endl;
@@ -127,7 +136,8 @@ int main() {
 
     // ==================== 7. Visualize Optimized Trajectory ====================
     auto opt_path = optimizer.sampleTrajectory(0.1); // Sample every 0.1s
-    visualize(*map, opt_path, start, goal, 40.0, "Optimized Trajectory");
+    visualize(*map, opt_path, start, goal,
+              "optimized_trajectory.png", show_window, 40.0, "Optimized Trajectory");
 
     return 0;
 }
@@ -137,6 +147,8 @@ void visualize(const grid_map::GridMap& map,
               const std::vector<Eigen::Vector2d>& path,
               const Eigen::Vector2d& start,
               const Eigen::Vector2d& goal,
+              const std::string& output_path,
+              bool show_window,
               double viz_size,
               const std::string& window_name) 
 {
@@ -190,7 +202,20 @@ void visualize(const grid_map::GridMap& map,
     cv::putText(img, "Goal", worldToPixel(goal) + cv::Point(scale*3, 0), 
                cv::FONT_HERSHEY_SIMPLEX, 0.5, cv::Scalar(255, 0, 0), 1);
 
-    // Display image
-    cv::imshow(window_name, img);
-    cv::waitKey(0);
+    cv::imwrite(output_path, img);
+    std::cout << "Saved visualization to " << output_path << std::endl;
+
+    const char* display_env = std::getenv("DISPLAY");
+    if (show_window && display_env != nullptr && display_env[0] != '\0') {
+        try {
+            cv::imshow(window_name, img);
+            cv::waitKey(0);
+        } catch (const cv::Exception& e) {
+            std::cout << "OpenCV interactive window is unavailable: "
+                      << e.what() << std::endl;
+            std::cout << "Keep the saved image instead." << std::endl;
+        }
+    } else if (show_window) {
+        std::cout << "DISPLAY is not available, skip interactive window." << std::endl;
+    }
 }
