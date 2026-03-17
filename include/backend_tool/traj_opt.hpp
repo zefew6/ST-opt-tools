@@ -65,8 +65,8 @@ public:
     using Vector3d = Eigen::Vector3d;
     using MatrixXd = Eigen::MatrixXd;
     using VectorXd = Eigen::VectorXd;
-    using PPoly2D = SplineTrajectory::PPolyND<2>;
     using QuinticSpline2D = SplineTrajectory::QuinticSpline2D;
+    using PPoly2D = QuinticSpline2D::TrajectoryType;
 
     explicit TrajectoryOptimizer(const TrajectoryParams& params = TrajectoryParams())
         : params_(params), in_opt_(false) {}
@@ -335,7 +335,7 @@ private:
         double energy = quintic_spline_.getEnergy();
         double energy_cost = params_.rho_energy * energy;
         
-        QuinticSpline2D::MatrixType gradP_energy = quintic_spline_.getEnergyGradInnerP();
+        QuinticSpline2D::MatrixType gradP_energy = quintic_spline_.getEnergyGradInnerPoints();
         Eigen::VectorXd gradT_energy = quintic_spline_.getEnergyGradTimes();
         
         gradPpos = gradPpos_constrain + params_.rho_energy * gradP_energy.transpose();
@@ -495,13 +495,10 @@ private:
         Eigen::VectorXd& gradTpos_out)
     {
         QuinticSpline2D::MatrixType gdC_typed = gdCpos;
-        QuinticSpline2D::MatrixType gradByPoints;
-        Eigen::VectorXd gradByTimes;
-        
-        quintic_spline_.propagateGrad(gdC_typed, gdTpos, gradByPoints, gradByTimes);
-        
-        gradPpos = gradByPoints.transpose();
-        gradTpos_out = gradByTimes;
+        auto grad_all = quintic_spline_.propagateGrad(gdC_typed, gdTpos);
+
+        gradPpos = grad_all.inner_points.transpose();
+        gradTpos_out = grad_all.times;
         
         std::cout << "Gradient norm - Ppos: " << gradPpos.norm() 
                 << ", Tpos: " << gradTpos_out.norm() << std::endl;
@@ -519,12 +516,12 @@ private:
         }
         times.push_back(t);
 
-        SplineTrajectory::SplineVector2D waypoints;
-        waypoints.push_back(initPos.col(0));
+        QuinticSpline2D::MatrixType waypoints(piece_pos_ + 1, 2);
+        waypoints.row(0) = initPos.col(0).transpose();
         for (int i = 0; i < innerPts.cols(); ++i) {
-            waypoints.push_back(innerPts.col(i));
+            waypoints.row(i + 1) = innerPts.col(i).transpose();
         }
-        waypoints.push_back(endPos.col(0));
+        waypoints.row(piece_pos_) = endPos.col(0).transpose();
 
         SplineTrajectory::BoundaryConditions<2> bc;
         bc.start_velocity = initPos.col(1);
