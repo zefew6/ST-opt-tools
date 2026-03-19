@@ -36,6 +36,14 @@
 
 namespace TrajOpt {
 
+enum class SpatialConstraintMode {
+    ESDF = 0,
+    SFC = 1,
+    ESDFAndSFC = 2,
+    Corridor = SFC,
+    ESDFAndCorridor = ESDFAndSFC
+};
+
 struct TrajectoryParams {
     double total_len = 10;
     double total_time = 10;
@@ -43,7 +51,8 @@ struct TrajectoryParams {
     double rho_v = 10000;           // Velocity penalty weight
     double rho_a = 10000;           // Acceleration penalty weight
     double rho_collision = 100000;  // Collision penalty weight
-    double rho_corridor = 100000;   // Safe corridor penalty weight
+    double rho_corridor = 100000;   // Backward-compatible alias of rho_sfc
+    double rho_sfc = 100000;        // Safe flight corridor penalty weight
     double rho_T = 100;             // Time penalty weight
     double rho_energy = 100;        // Energy (smoothness) penalty weight
     double max_v = 1.0;             // Maximum velocity
@@ -57,6 +66,9 @@ struct TrajectoryParams {
     double min_step = 1e-32;        // Minimum step size
     double delta = 1e-5;            // Function change convergence threshold
     int max_iter = 10000;           // Maximum iterations
+    bool use_corridor_parameterization = false; // Backward-compatible alias
+    bool use_sfc_parameterization = false;
+    SpatialConstraintMode constraint_mode = SpatialConstraintMode::ESDF;
 };
 
 class TrajectoryOptimizer {
@@ -65,6 +77,7 @@ public:
     using Vector3d = Eigen::Vector3d;
     using MatrixXd = Eigen::MatrixXd;
     using VectorXd = Eigen::VectorXd;
+    using CorridorPolytope2D = Eigen::Matrix<double, 2, Eigen::Dynamic>;
     using QuinticSpline2D = SplineTrajectory::QuinticSpline2D;
     using PPoly2D = QuinticSpline2D::TrajectoryType;
 
@@ -152,6 +165,24 @@ public:
     PPoly2D getOptimizedTrajectory() const { return trajectory_; }
     int getLastOptResult() const { return last_opt_result_; }
     double getLastOptCost() const { return last_opt_cost_; }
+    bool isUsingCorridorParameterization() const { return use_sfc_parameterization_; }
+    bool isUsingSFCParameterization() const { return use_sfc_parameterization_; }
+
+    static bool usesESDFConstraints(SpatialConstraintMode mode) {
+        return mode == SpatialConstraintMode::ESDF ||
+               mode == SpatialConstraintMode::ESDFAndCorridor;
+    }
+
+    static bool usesSFCConstraints(SpatialConstraintMode mode) {
+        return mode == SpatialConstraintMode::SFC ||
+               mode == SpatialConstraintMode::ESDFAndSFC ||
+               mode == SpatialConstraintMode::Corridor ||
+               mode == SpatialConstraintMode::ESDFAndCorridor;
+    }
+
+    static bool usesCorridorConstraints(SpatialConstraintMode mode) {
+        return usesSFCConstraints(mode);
+    }
 
     struct TrajectoryMetrics {
         double max_velocity;
@@ -232,6 +263,377 @@ private:
         // Prepare guide path for fast nearest neighbor queries
     }
 
+    static bool isApproxDuplicate(const Vector2d& a, const Vector2d& b, double eps = 1.0e-8) {
+        return (a - b).norm() <= eps;
+    }
+
+    static std::vector<Vector2d> halfspacesToVertices(const CorridorPiece2D& piece) {
+        std::vector<Vector2d> vertices;
+        const int n = static_cast<int>(piece.size());
+        if (n < 3) {
+            return vertices;
+        }
+
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                Eigen::Matrix2d M;
+                M.row(0) = piece[i].normal.transpose();
+                M.row(1) = piece[j].normal.transpose();
+                if (std::abs(M.determinant()) < 1.0e-10) {
+                    continue;
+                }
+
+                const Vector2d rhs(piece[i].offset, piece[j].offset);
+                const Vector2d vertex = M.inverse() * rhs;
+
+                bool inside = true;
+                for (const auto& half_space : piece) {
+                    if (half_space.normal.dot(vertex) > half_space.offset + 1.0e-7) {
+                        inside = false;
+                        break;
+                    }
+                }
+                if (!inside) {
+                    continue;
+                }
+
+                bool duplicated = false;
+                for (const auto& existing : vertices) {
+                    if (isApproxDuplicate(existing, vertex)) {
+                        duplicated = true;
+                        break;
+                    }
+                }
+                if (!duplicated) {
+                    vertices.push_back(vertex);
+                }
+            }
+        }
+
+        if (vertices.size() < 3) {
+            return {};
+        }
+
+        Vector2d centroid = Vector2d::Zero();
+        for (const auto& v : vertices) {
+            centroid += v;
+        }
+        centroid /= static_cast<double>(vertices.size());
+
+        std::sort(vertices.begin(), vertices.end(),
+                  [&centroid](const Vector2d& a, const Vector2d& b) {
+                      return std::atan2(a.y() - centroid.y(), a.x() - centroid.x()) <
+                             std::atan2(b.y() - centroid.y(), b.x() - centroid.x());
+                  });
+        return vertices;
+    }
+
+    static CorridorPiece2D intersectPieces(const CorridorPiece2D& lhs,
+                                           const CorridorPiece2D& rhs) {
+        CorridorPiece2D merged = lhs;
+        merged.insert(merged.end(), rhs.begin(), rhs.end());
+        return merged;
+    }
+
+    static CorridorPolytope2D buildVPolytope(const std::vector<Vector2d>& vertices) {
+        CorridorPolytope2D poly(2, static_cast<int>(vertices.size()));
+        for (int i = 0; i < static_cast<int>(vertices.size()); ++i) {
+            poly.col(i) = vertices[i];
+        }
+        return poly;
+    }
+
+    static bool isInsidePiece(const CorridorPiece2D& piece,
+                              const Vector2d& point,
+                              double tol = 1.0e-7) {
+        for (const auto& half_space : piece) {
+            if (half_space.normal.dot(point) > half_space.offset + tol) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    static Vector2d polytopeCentroid(const std::vector<Vector2d>& vertices) {
+        Vector2d centroid = Vector2d::Zero();
+        if (vertices.empty()) {
+            return centroid;
+        }
+        for (const auto& v : vertices) {
+            centroid += v;
+        }
+        return centroid / static_cast<double>(vertices.size());
+    }
+
+    static bool buildShortestPathThroughPolytopes(
+        const Vector2d& start,
+        const Vector2d& goal,
+        const std::vector<CorridorPiece2D>& sfc,
+        const std::vector<std::vector<Vector2d>>& overlap_vertices,
+        MatrixXd& path_points) {
+        const int overlap_num = static_cast<int>(overlap_vertices.size());
+        path_points.resize(2, overlap_num);
+        if (overlap_num == 0) {
+            return true;
+        }
+
+        std::vector<std::vector<Vector2d>> layers(overlap_num + 2);
+        layers.front().push_back(start);
+        for (int i = 0; i < overlap_num; ++i) {
+            layers[i + 1] = overlap_vertices[i];
+            if (layers[i + 1].empty()) {
+                return false;
+            }
+        }
+        layers.back().push_back(goal);
+
+        const double inf = std::numeric_limits<double>::infinity();
+        std::vector<VectorXd> dist(layers.size());
+        std::vector<std::vector<int>> prev(layers.size());
+        dist[0] = VectorXd::Zero(1);
+        prev[0] = std::vector<int>(1, -1);
+
+        for (size_t layer_idx = 1; layer_idx < layers.size(); ++layer_idx) {
+            const auto& cur_layer = layers[layer_idx];
+            const auto& prev_layer = layers[layer_idx - 1];
+            dist[layer_idx] = VectorXd::Constant(static_cast<int>(cur_layer.size()), inf);
+            prev[layer_idx] = std::vector<int>(cur_layer.size(), -1);
+
+            int piece_idx = static_cast<int>(layer_idx) - 1;
+            piece_idx = std::max(0, std::min(piece_idx, static_cast<int>(sfc.size()) - 1));
+            const CorridorPiece2D& piece = sfc[piece_idx];
+
+            for (int j = 0; j < static_cast<int>(cur_layer.size()); ++j) {
+                const Vector2d& cur_pt = cur_layer[j];
+                for (int k = 0; k < static_cast<int>(prev_layer.size()); ++k) {
+                    const Vector2d& prev_pt = prev_layer[k];
+                    if (!isInsidePiece(piece, prev_pt) || !isInsidePiece(piece, cur_pt)) {
+                        continue;
+                    }
+                    const double candidate = dist[layer_idx - 1](k) + (cur_pt - prev_pt).norm();
+                    if (candidate < dist[layer_idx](j)) {
+                        dist[layer_idx](j) = candidate;
+                        prev[layer_idx][j] = k;
+                    }
+                }
+            }
+        }
+
+        if (!std::isfinite(dist.back()(0))) {
+            for (int i = 0; i < overlap_num; ++i) {
+                path_points.col(i) = polytopeCentroid(overlap_vertices[i]);
+            }
+            return true;
+        }
+
+        std::vector<int> indices(layers.size(), -1);
+        indices.back() = 0;
+        for (int layer_idx = static_cast<int>(layers.size()) - 1; layer_idx > 0; --layer_idx) {
+            const int prev_idx = prev[layer_idx][indices[layer_idx]];
+            if (prev_idx < 0) {
+                return false;
+            }
+            indices[layer_idx - 1] = prev_idx;
+        }
+
+        for (int i = 0; i < overlap_num; ++i) {
+            path_points.col(i) = layers[i + 1][indices[i + 1]];
+        }
+        return true;
+    }
+
+    static const std::vector<SFCPiece2D>* extractSFC(const std::shared_ptr<TrajectoryEnv>& env) {
+        if (!env) {
+            return nullptr;
+        }
+        return env->getSFCPtr();
+    }
+
+    static void forwardP(const VectorXd& xi,
+                         const std::vector<CorridorPolytope2D>& polytopes,
+                         MatrixXd& P) {
+        const int point_num = static_cast<int>(polytopes.size());
+        P.resize(2, point_num);
+
+        VectorXd q;
+        for (int i = 0, offset = 0; i < point_num; ++i) {
+            const int k = polytopes[i].cols();
+            q = xi.segment(offset, k).normalized().head(k - 1);
+            P.col(i) = polytopes[i].col(0) +
+                       polytopes[i].rightCols(k - 1) * q.cwiseProduct(q);
+            offset += k;
+        }
+    }
+
+    static double costTinyNLS(void* ptr,
+                              const VectorXd& xi,
+                              VectorXd& gradXi) {
+        const int n = xi.size();
+        const CorridorPolytope2D& ov_poly = *static_cast<CorridorPolytope2D*>(ptr);
+
+        const double sqr_norm_xi = xi.squaredNorm();
+        const double inv_norm_xi = 1.0 / std::sqrt(sqr_norm_xi);
+        const VectorXd unit_xi = xi * inv_norm_xi;
+        const VectorXd r = unit_xi.head(n - 1);
+        const Vector2d delta =
+            ov_poly.rightCols(n - 1) * r.cwiseProduct(r) + ov_poly.col(1) - ov_poly.col(0);
+
+        double cost = delta.squaredNorm();
+        gradXi.resize(n);
+        gradXi.head(n - 1) =
+            (ov_poly.rightCols(n - 1).transpose() * (2.0 * delta)).array() *
+            r.array() * 2.0;
+        gradXi(n - 1) = 0.0;
+        gradXi = (gradXi - unit_xi.dot(gradXi) * unit_xi).eval() * inv_norm_xi;
+
+        const double sqr_norm_violation = sqr_norm_xi - 1.0;
+        if (sqr_norm_violation > 0.0) {
+            double c = sqr_norm_violation * sqr_norm_violation;
+            const double dc = 3.0 * c;
+            c *= sqr_norm_violation;
+            cost += c;
+            gradXi += dc * 2.0 * xi;
+        }
+
+        return cost;
+    }
+
+    static void backwardP(const MatrixXd& P,
+                          const std::vector<CorridorPolytope2D>& polytopes,
+                          VectorXd& xi) {
+        int spatial_dim = 0;
+        for (const auto& poly : polytopes) {
+            spatial_dim += poly.cols();
+        }
+        xi.resize(spatial_dim);
+
+        lbfgs::lbfgs_parameter_t tiny_nls_params;
+        tiny_nls_params.past = 0;
+        tiny_nls_params.delta = 1.0e-5;
+        tiny_nls_params.g_epsilon = std::numeric_limits<double>::epsilon();
+        tiny_nls_params.max_iterations = 128;
+
+        for (int i = 0, offset = 0; i < P.cols(); ++i) {
+            const int k = polytopes[i].cols();
+            CorridorPolytope2D ov_poly(2, k + 1);
+            ov_poly.col(0) = P.col(i);
+            ov_poly.rightCols(k) = polytopes[i];
+
+            VectorXd x(k);
+            x.setConstant(std::sqrt(1.0 / static_cast<double>(k)));
+            double min_sqr_d = 0.0;
+            lbfgs::lbfgs_optimize(x, min_sqr_d,
+                                  &TrajectoryOptimizer::costTinyNLS,
+                                  nullptr, nullptr,
+                                  &ov_poly, tiny_nls_params);
+            xi.segment(offset, k) = x;
+            offset += k;
+        }
+    }
+
+    template <typename EIGENVEC>
+    static void backwardGradP(const VectorXd& xi,
+                              const std::vector<CorridorPolytope2D>& polytopes,
+                              const MatrixXd& gradP,
+                              EIGENVEC& gradXi) {
+        gradXi.resize(xi.size());
+
+        VectorXd q, gradQ, unitQ;
+        for (int i = 0, offset = 0; i < gradP.cols(); ++i) {
+            const int k = polytopes[i].cols();
+            q = xi.segment(offset, k);
+            const double norm_inv = 1.0 / q.norm();
+            unitQ = q * norm_inv;
+            gradQ.resize(k);
+            gradQ.head(k - 1) =
+                (polytopes[i].rightCols(k - 1).transpose() * gradP.col(i)).array() *
+                unitQ.head(k - 1).array() * 2.0;
+            gradQ(k - 1) = 0.0;
+            gradXi.segment(offset, k) =
+                (gradQ - unitQ * unitQ.dot(gradQ)) * norm_inv;
+            offset += k;
+        }
+    }
+
+    template <typename EIGENVEC>
+    static void normRestrictionLayer(const VectorXd& xi,
+                                     const std::vector<CorridorPolytope2D>& polytopes,
+                                     double& extra_cost,
+                                     EIGENVEC& gradXi) {
+        if (gradXi.size() != xi.size()) {
+            gradXi = VectorXd::Zero(xi.size());
+        }
+
+        for (int i = 0, offset = 0; i < static_cast<int>(polytopes.size()); ++i) {
+            const int k = polytopes[i].cols();
+            const VectorXd q = xi.segment(offset, k);
+            const double sqr_norm_violation = q.squaredNorm() - 1.0;
+            if (sqr_norm_violation > 0.0) {
+                double c = sqr_norm_violation * sqr_norm_violation;
+                const double dc = 3.0 * c;
+                c *= sqr_norm_violation;
+                extra_cost += c;
+                gradXi.segment(offset, k) += dc * 2.0 * q;
+            }
+            offset += k;
+        }
+    }
+
+    bool buildSFCParameterization() {
+        sfc_point_polys_.clear();
+        sfc_spatial_dim_ = 0;
+        sfc_initial_inner_points_.resize(2, 0);
+
+        if (!(params_.use_sfc_parameterization || params_.use_corridor_parameterization) ||
+            !usesSFCConstraints(params_.constraint_mode) ||
+            piece_pos_ < 2 || !env_) {
+            return false;
+        }
+
+        const auto* sfc = extractSFC(env_);
+        if (sfc == nullptr) {
+            return false;
+        }
+
+        if (static_cast<int>(sfc->size()) != piece_pos_) {
+            return false;
+        }
+
+        sfc_point_polys_.reserve(piece_pos_ - 1);
+        std::vector<std::vector<Vector2d>> overlap_vertices;
+        overlap_vertices.reserve(piece_pos_ - 1);
+        for (int i = 0; i < piece_pos_ - 1; ++i) {
+            CorridorPiece2D overlap = intersectPieces((*sfc)[i], (*sfc)[i + 1]);
+            std::vector<Vector2d> vertices = halfspacesToVertices(overlap);
+            if (vertices.size() < 3) {
+                vertices = halfspacesToVertices((*sfc)[i]);
+            }
+            if (vertices.size() < 3) {
+                sfc_point_polys_.clear();
+                sfc_spatial_dim_ = 0;
+                return false;
+            }
+
+            overlap_vertices.push_back(vertices);
+            sfc_point_polys_.push_back(buildVPolytope(vertices));
+            sfc_spatial_dim_ += sfc_point_polys_.back().cols();
+        }
+
+        if (static_cast<int>(sfc_point_polys_.size()) != piece_pos_ - 1) {
+            return false;
+        }
+
+        return buildShortestPathThroughPolytopes(init_pos_.col(0),
+                                                 end_pos_.col(0),
+                                                 *sfc,
+                                                 overlap_vertices,
+                                                 sfc_initial_inner_points_);
+    }
+
+    bool buildCorridorParameterization() {
+        return buildSFCParameterization();
+    }
+
     int optimizeSE2Traj(const MatrixXd& initPos, const MatrixXd& innerPtsPos,
                         const MatrixXd& endPos, double totalTime) {
         piece_pos_ = innerPtsPos.cols() + 1;
@@ -248,19 +650,35 @@ private:
                         const MatrixXd& endPos, const VectorXd& initTpos) {
         in_opt_ = true;
         piece_pos_ = innerPtsPos.cols() + 1;
-
         init_pos_ = initPos;
         end_pos_ = endPos;
+        use_sfc_parameterization_ = buildSFCParameterization();
+        use_corridor_parameterization_ = use_sfc_parameterization_;
 
         dim_T = piece_pos_;
-        int variable_num = 2 * (piece_pos_ - 1) + dim_T;
+        const int spatial_dim = use_sfc_parameterization_
+                                    ? sfc_spatial_dim_
+                                    : 2 * (piece_pos_ - 1);
+        int variable_num = spatial_dim + dim_T;
 
         Eigen::VectorXd x;
         x.resize(variable_num);
 
         Eigen::Map<Eigen::VectorXd> tau(x.data(), dim_T);
-        Eigen::Map<Eigen::MatrixXd> Ppos(x.data() + dim_T, 2, piece_pos_ - 1);
-        Ppos = innerPtsPos;
+        MatrixXd Ppos = innerPtsPos;
+        if (use_sfc_parameterization_ &&
+            sfc_initial_inner_points_.cols() == piece_pos_ - 1) {
+            Ppos = sfc_initial_inner_points_;
+        }
+        if (use_sfc_parameterization_) {
+            VectorXd xi;
+            backwardP(Ppos, sfc_point_polys_, xi);
+            Eigen::Map<Eigen::VectorXd> xiMap(x.data() + dim_T, spatial_dim);
+            xiMap = xi;
+        } else {
+            Eigen::Map<Eigen::MatrixXd> PposMap(x.data() + dim_T, 2, piece_pos_ - 1);
+            PposMap = innerPtsPos;
+        }
 
         Eigen::VectorXd Tpos;
         if (initTpos.size() != piece_pos_) {
@@ -315,12 +733,18 @@ private:
 
         Eigen::Map<const Eigen::VectorXd> tau(x.data(), dim_T);
         Eigen::Map<Eigen::VectorXd> gradTau(grad.data(), dim_T);
-        Eigen::Map<const Eigen::MatrixXd> Ppos(x.data() + dim_T, 2, piece_pos_ - 1);
-        Eigen::Map<Eigen::MatrixXd> gradPpos(grad.data() + dim_T, 2, piece_pos_ - 1);
-     
+        MatrixXd Ppos(2, piece_pos_ - 1);
+
         Eigen::VectorXd Tpos;
         Tpos.resize(piece_pos_);
         calTfromTau(tau, Tpos);
+        if (use_sfc_parameterization_) {
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dim_T, sfc_spatial_dim_);
+            forwardP(xi, sfc_point_polys_, Ppos);
+        } else {
+            Eigen::Map<const Eigen::MatrixXd> PposMap(x.data() + dim_T, 2, piece_pos_ - 1);
+            Ppos = PposMap;
+        }
         generateTrajectory(init_pos_, end_pos_, Ppos, Tpos);
 
         double constrain_cost = 0.0;
@@ -338,7 +762,7 @@ private:
         QuinticSpline2D::MatrixType gradP_energy = quintic_spline_.getEnergyGradInnerPoints();
         Eigen::VectorXd gradT_energy = quintic_spline_.getEnergyGradTimes();
         
-        gradPpos = gradPpos_constrain + params_.rho_energy * gradP_energy.transpose();
+        MatrixXd gradPposTotal = gradPpos_constrain + params_.rho_energy * gradP_energy.transpose();
         Eigen::VectorXd gradTpos_total = gradTpos_constrain + params_.rho_energy * gradT_energy;
 
         double tau_cost = params_.rho_T * Tpos.sum();
@@ -348,6 +772,16 @@ private:
         gradTau = grad_tau;
 
         cost = constrain_cost + energy_cost + tau_cost;
+        if (use_sfc_parameterization_) {
+            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dim_T, sfc_spatial_dim_);
+            Eigen::Map<Eigen::VectorXd> gradXi(grad.data() + dim_T, sfc_spatial_dim_);
+            backwardGradP(xi, sfc_point_polys_, gradPposTotal, gradXi);
+            normRestrictionLayer(xi, sfc_point_polys_, cost, gradXi);
+        } else {
+            Eigen::Map<Eigen::MatrixXd> gradPpos(grad.data() + dim_T, 2, piece_pos_ - 1);
+            gradPpos = gradPposTotal;
+        }
+
         return cost;
     }
 
@@ -361,7 +795,7 @@ private:
         double v_cost = 0.0;
         double a_cost = 0.0;
         double occ_cost = 0.0;
-        double corridor_cost = 0.0;
+        double sfc_cost = 0.0;
         
         const int N = traj.getNumSegments();
         gdCpos.resize(6 * N, 2);
@@ -378,7 +812,7 @@ private:
         Eigen::Vector2d grad_v = Eigen::Vector2d::Zero();
         Eigen::Vector2d grad_a = Eigen::Vector2d::Zero();
         Eigen::Vector2d grad_sdf = Eigen::Vector2d::Zero();
-        Eigen::Vector2d grad_corridor = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_sfc = Eigen::Vector2d::Zero();
         Eigen::Matrix<double, 6, 1> beta0, beta1, beta2, beta3;
         double s1, s2, s3, s4, s5;
         double step, alpha, omg;
@@ -436,7 +870,8 @@ private:
                 // 3. Collision constraint
                 if (env_) {
                     double sdf_value;
-                    if (env_->getDistanceAndGradient(pos, sdf_value, grad_sdf)) {
+                    if (usesESDFConstraints(params_.constraint_mode) &&
+                        env_->getDistanceAndGradient(pos, sdf_value, grad_sdf)) {
                         double cViola = params_.safe_threshold - sdf_value;
                         if (cViola > 0 && sdf_value < 5) {
                             double penalty;
@@ -460,13 +895,15 @@ private:
                         }
                     }
 
-                    double corridor_viola;
-                    if (env_->getSafeCorridorViolation(i, pos, corridor_viola, grad_corridor) &&
-                        corridor_viola > 0.0) {
-                        const double cost_sc = params_.rho_corridor * corridor_viola * corridor_viola;
-                        const Eigen::Vector2d grad_sc = params_.rho_corridor * 2.0 * corridor_viola * grad_corridor;
+                    double sfc_viola;
+                    if (usesSFCConstraints(params_.constraint_mode) &&
+                        env_->getSFCViolation(i, pos, sfc_viola, grad_sfc) &&
+                        sfc_viola > 0.0) {
+                        const double sfc_weight = params_.rho_sfc > 0.0 ? params_.rho_sfc : params_.rho_corridor;
+                        const double cost_sc = sfc_weight * sfc_viola * sfc_viola;
+                        const Eigen::Vector2d grad_sc = sfc_weight * 2.0 * sfc_viola * grad_sfc;
                         cost += cost_sc * omg * step;
-                        corridor_cost += cost_sc * omg * step;
+                        sfc_cost += cost_sc * omg * step;
                         grad_time += omg * (cost_sc / params_.int_K + step * alpha * grad_sc.dot(vel));
                         grad_p += grad_sc;
                     }
@@ -485,7 +922,7 @@ private:
         std::cout << "Cost breakdown - Vel: " << v_cost
                   << ", Acc: " << a_cost
                   << ", Coll: " << occ_cost
-                  << ", Corridor: " << corridor_cost << std::endl;
+                  << ", SFC: " << sfc_cost << std::endl;
     }
 
     void calGradCTtoQT(
@@ -611,6 +1048,11 @@ private:
     int current_segment_ = 0;
     int last_opt_result_ = lbfgs::LBFGSERR_UNKNOWNERROR;
     double last_opt_cost_ = 0.0;
+    bool use_sfc_parameterization_ = false;
+    bool use_corridor_parameterization_ = false;
+    std::vector<CorridorPolytope2D> sfc_point_polys_;
+    int sfc_spatial_dim_ = 0;
+    MatrixXd sfc_initial_inner_points_;
 };
 
 } // namespace TrajOpt

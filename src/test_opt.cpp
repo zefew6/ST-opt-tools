@@ -109,6 +109,8 @@ int main(int argc, char** argv) {
     params.piece_len = astar_traj.total_length / astar_traj.total_time;
     params.total_time = astar_traj.total_time;
     params.total_len = astar_traj.total_length;
+    params.constraint_mode = TrajOpt::SpatialConstraintMode::ESDF;
+    params.use_corridor_parameterization = false;
 
     auto env = std::make_shared<TrajOpt::GridMapEnv>(map);
     TrajOpt::TrajectoryOptimizer optimizer(

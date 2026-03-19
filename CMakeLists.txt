@@ -39,3 +39,9 @@ target_link_libraries(test_opt Eigen3::Eigen  ${OpenCV_LIBS})
 
 add_executable(test_backend src/test_backend.cpp)
 target_link_libraries(test_backend Eigen3::Eigen)
+
+add_executable(test_firi_corridor src/test_firi_corridor.cpp)
+target_link_libraries(test_firi_corridor Eigen3::Eigen ${OpenCV_LIBS})
+
+add_executable(test_gcopter_style_pipeline src/test_gcopter_style_pipeline.cpp)
+target_link_libraries(test_gcopter_style_pipeline Eigen3::Eigen ${OpenCV_LIBS})
