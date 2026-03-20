@@ -58,6 +58,7 @@ struct TrajectoryParams {
     double max_v = 1.0;             // Maximum velocity
     double max_a = 1.0;             // Maximum acceleration
     double safe_threshold = 0.5;    // Safety distance threshold
+    double sfc_smooth_factor = 1.0e-2; // GCOPTER-style smoothing factor for corridor penalties
     
     int int_K = 32;                 // Integration sample points
     int mem_size = 256;             // L-BFGS memory size
@@ -335,10 +336,23 @@ private:
         return merged;
     }
 
+    static CorridorPiece2D normalizePiece(const CorridorPiece2D& piece) {
+        CorridorPiece2D normalized = piece;
+        for (auto& half_space : normalized) {
+            const double norm = half_space.normal.norm();
+            if (norm > 1.0e-10) {
+                half_space.normal /= norm;
+                half_space.offset /= norm;
+            }
+        }
+        return normalized;
+    }
+
     static CorridorPolytope2D buildVPolytope(const std::vector<Vector2d>& vertices) {
         CorridorPolytope2D poly(2, static_cast<int>(vertices.size()));
-        for (int i = 0; i < static_cast<int>(vertices.size()); ++i) {
-            poly.col(i) = vertices[i];
+        poly.col(0) = vertices.front();
+        for (int i = 1; i < static_cast<int>(vertices.size()); ++i) {
+            poly.col(i) = vertices[i] - vertices.front();
         }
         return poly;
     }
@@ -372,8 +386,12 @@ private:
         const std::vector<std::vector<Vector2d>>& overlap_vertices,
         MatrixXd& path_points) {
         const int overlap_num = static_cast<int>(overlap_vertices.size());
-        path_points.resize(2, overlap_num);
+        path_points.resize(2, overlap_num + 2);
+        path_points.col(0) = start;
+        path_points.col(overlap_num + 1) = goal;
         if (overlap_num == 0) {
+            path_points.col(0) = start;
+            path_points.col(1) = goal;
             return true;
         }
 
@@ -421,7 +439,7 @@ private:
 
         if (!std::isfinite(dist.back()(0))) {
             for (int i = 0; i < overlap_num; ++i) {
-                path_points.col(i) = polytopeCentroid(overlap_vertices[i]);
+                path_points.col(i + 1) = polytopeCentroid(overlap_vertices[i]);
             }
             return true;
         }
@@ -437,8 +455,143 @@ private:
         }
 
         for (int i = 0; i < overlap_num; ++i) {
-            path_points.col(i) = layers[i + 1][indices[i + 1]];
+            path_points.col(i + 1) = layers[i + 1][indices[i + 1]];
         }
+        return true;
+    }
+
+    static void allocatePiecesByPathLength(const MatrixXd& path,
+                                           int total_piece_num,
+                                           Eigen::VectorXi& piece_counts) {
+        const int interval_num = static_cast<int>(path.cols()) - 1;
+        piece_counts = Eigen::VectorXi::Ones(interval_num);
+        if (interval_num <= 0) {
+            return;
+        }
+
+        int remaining = total_piece_num - interval_num;
+        if (remaining <= 0) {
+            return;
+        }
+
+        Eigen::VectorXd seg_lengths(interval_num);
+        double total_length = 0.0;
+        for (int i = 0; i < interval_num; ++i) {
+            seg_lengths(i) = (path.col(i + 1) - path.col(i)).norm();
+            total_length += seg_lengths(i);
+        }
+
+        if (total_length < 1.0e-10) {
+            for (int i = 0; i < remaining; ++i) {
+                piece_counts(i % interval_num) += 1;
+            }
+            return;
+        }
+
+        Eigen::VectorXd desired_extra = seg_lengths / total_length * remaining;
+        for (int i = 0; i < interval_num; ++i) {
+            const int extra = static_cast<int>(std::floor(desired_extra(i)));
+            piece_counts(i) += extra;
+            remaining -= extra;
+            desired_extra(i) -= extra;
+        }
+
+        while (remaining > 0) {
+            Eigen::Index idx = 0;
+            desired_extra.maxCoeff(&idx);
+            piece_counts(static_cast<int>(idx)) += 1;
+            desired_extra(idx) = 0.0;
+            remaining -= 1;
+        }
+    }
+
+    static void allocatePiecesByLength(const MatrixXd& path,
+                                       double piece_len,
+                                       Eigen::VectorXi& piece_counts) {
+        const int interval_num = static_cast<int>(path.cols()) - 1;
+        piece_counts.resize(std::max(0, interval_num));
+        if (interval_num <= 0) {
+            return;
+        }
+
+        const double target_piece_len = std::max(piece_len, 1.0e-3);
+        for (int i = 0; i < interval_num; ++i) {
+            const double seg_len = (path.col(i + 1) - path.col(i)).norm();
+            piece_counts(i) = std::max(1, static_cast<int>(seg_len / target_piece_len) + 1);
+        }
+    }
+
+    static void buildTimeAllocationFromPath(const MatrixXd& path,
+                                            const Eigen::VectorXi& piece_counts,
+                                            double speed,
+                                            VectorXd& time_alloc) {
+        const int interval_num = piece_counts.size();
+        const int total_piece_num = piece_counts.sum();
+        time_alloc.resize(std::max(0, total_piece_num));
+        if (interval_num <= 0 || total_piece_num <= 0) {
+            return;
+        }
+
+        const double alloc_speed = std::max(speed, 1.0e-3);
+        for (int i = 0, offset = 0; i < interval_num; ++i) {
+            const int pieces = piece_counts(i);
+            const double dt = (path.col(i + 1) - path.col(i)).norm() /
+                              (alloc_speed * static_cast<double>(pieces));
+            time_alloc.segment(offset, pieces).setConstant(std::max(dt, 1.0e-3));
+            offset += pieces;
+        }
+    }
+
+    static void buildInitialFromPath(const MatrixXd& path,
+                                     const Eigen::VectorXi& piece_counts,
+                                     MatrixXd& inner_points) {
+        const int interval_num = piece_counts.size();
+        const int total_piece_num = piece_counts.sum();
+        inner_points.resize(2, std::max(0, total_piece_num - 1));
+        if (interval_num <= 0 || total_piece_num <= 1) {
+            return;
+        }
+
+        int point_idx = 0;
+        for (int i = 0; i < interval_num; ++i) {
+            const int pieces = piece_counts(i);
+            const Vector2d a = path.col(i);
+            const Vector2d b = path.col(i + 1);
+            const Vector2d step = (b - a) / static_cast<double>(pieces);
+            for (int j = 0; j < pieces; ++j) {
+                if (i > 0 || j > 0) {
+                    inner_points.col(point_idx++) = a + step * static_cast<double>(j);
+                }
+            }
+        }
+    }
+
+    bool processSFC(const std::vector<CorridorPiece2D>& sfc) {
+        sfc_v_polytopes_.clear();
+        sfc_v_polytopes_.reserve(std::max(0, 2 * static_cast<int>(sfc.size()) - 1));
+        if (sfc.empty()) {
+            return false;
+        }
+
+        for (int i = 0; i + 1 < static_cast<int>(sfc.size()); ++i) {
+            std::vector<Vector2d> vertices = halfspacesToVertices(sfc[i]);
+            if (vertices.size() < 3) {
+                return false;
+            }
+            sfc_v_polytopes_.push_back(buildVPolytope(vertices));
+
+            std::vector<Vector2d> overlap_vertices = halfspacesToVertices(intersectPieces(sfc[i], sfc[i + 1]));
+            if (overlap_vertices.size() < 3) {
+                return false;
+            }
+            sfc_v_polytopes_.push_back(buildVPolytope(overlap_vertices));
+        }
+
+        std::vector<Vector2d> last_vertices = halfspacesToVertices(sfc.back());
+        if (last_vertices.size() < 3) {
+            return false;
+        }
+        sfc_v_polytopes_.push_back(buildVPolytope(last_vertices));
         return true;
     }
 
@@ -450,17 +603,19 @@ private:
     }
 
     static void forwardP(const VectorXd& xi,
+                         const Eigen::VectorXi& poly_idx,
                          const std::vector<CorridorPolytope2D>& polytopes,
                          MatrixXd& P) {
-        const int point_num = static_cast<int>(polytopes.size());
+        const int point_num = poly_idx.size();
         P.resize(2, point_num);
 
         VectorXd q;
         for (int i = 0, offset = 0; i < point_num; ++i) {
-            const int k = polytopes[i].cols();
+            const int poly_id = poly_idx(i);
+            const int k = polytopes[poly_id].cols();
             q = xi.segment(offset, k).normalized().head(k - 1);
-            P.col(i) = polytopes[i].col(0) +
-                       polytopes[i].rightCols(k - 1) * q.cwiseProduct(q);
+            P.col(i) = polytopes[poly_id].col(0) +
+                       polytopes[poly_id].rightCols(k - 1) * q.cwiseProduct(q);
             offset += k;
         }
     }
@@ -499,11 +654,12 @@ private:
     }
 
     static void backwardP(const MatrixXd& P,
+                          const Eigen::VectorXi& poly_idx,
                           const std::vector<CorridorPolytope2D>& polytopes,
                           VectorXd& xi) {
         int spatial_dim = 0;
-        for (const auto& poly : polytopes) {
-            spatial_dim += poly.cols();
+        for (int i = 0; i < poly_idx.size(); ++i) {
+            spatial_dim += polytopes[poly_idx(i)].cols();
         }
         xi.resize(spatial_dim);
 
@@ -514,10 +670,11 @@ private:
         tiny_nls_params.max_iterations = 128;
 
         for (int i = 0, offset = 0; i < P.cols(); ++i) {
-            const int k = polytopes[i].cols();
+            const int poly_id = poly_idx(i);
+            const int k = polytopes[poly_id].cols();
             CorridorPolytope2D ov_poly(2, k + 1);
             ov_poly.col(0) = P.col(i);
-            ov_poly.rightCols(k) = polytopes[i];
+            ov_poly.rightCols(k) = polytopes[poly_id];
 
             VectorXd x(k);
             x.setConstant(std::sqrt(1.0 / static_cast<double>(k)));
@@ -533,6 +690,7 @@ private:
 
     template <typename EIGENVEC>
     static void backwardGradP(const VectorXd& xi,
+                              const Eigen::VectorXi& poly_idx,
                               const std::vector<CorridorPolytope2D>& polytopes,
                               const MatrixXd& gradP,
                               EIGENVEC& gradXi) {
@@ -540,13 +698,14 @@ private:
 
         VectorXd q, gradQ, unitQ;
         for (int i = 0, offset = 0; i < gradP.cols(); ++i) {
-            const int k = polytopes[i].cols();
+            const int poly_id = poly_idx(i);
+            const int k = polytopes[poly_id].cols();
             q = xi.segment(offset, k);
             const double norm_inv = 1.0 / q.norm();
             unitQ = q * norm_inv;
             gradQ.resize(k);
             gradQ.head(k - 1) =
-                (polytopes[i].rightCols(k - 1).transpose() * gradP.col(i)).array() *
+                (polytopes[poly_id].rightCols(k - 1).transpose() * gradP.col(i)).array() *
                 unitQ.head(k - 1).array() * 2.0;
             gradQ(k - 1) = 0.0;
             gradXi.segment(offset, k) =
@@ -557,6 +716,7 @@ private:
 
     template <typename EIGENVEC>
     static void normRestrictionLayer(const VectorXd& xi,
+                                     const Eigen::VectorXi& poly_idx,
                                      const std::vector<CorridorPolytope2D>& polytopes,
                                      double& extra_cost,
                                      EIGENVEC& gradXi) {
@@ -564,8 +724,8 @@ private:
             gradXi = VectorXd::Zero(xi.size());
         }
 
-        for (int i = 0, offset = 0; i < static_cast<int>(polytopes.size()); ++i) {
-            const int k = polytopes[i].cols();
+        for (int i = 0, offset = 0; i < poly_idx.size(); ++i) {
+            const int k = polytopes[poly_idx(i)].cols();
             const VectorXd q = xi.segment(offset, k);
             const double sqr_norm_violation = q.squaredNorm() - 1.0;
             if (sqr_norm_violation > 0.0) {
@@ -579,14 +739,66 @@ private:
         }
     }
 
+    static bool smoothedL1(const double& x,
+                                 const double& mu,
+                                 double& f,
+                                 double& df) {
+        if (x < 0.0) {
+            return false;
+        }
+        if (x > mu) {
+            f = x - 0.5 * mu;
+            df = 1.0;
+            return true;
+        }
+
+        const double xdmu = x / mu;
+        const double sqrxdmu = xdmu * xdmu;
+        const double mumxd2 = mu - 0.5 * x;
+        f = mumxd2 * sqrxdmu * xdmu;
+        df = sqrxdmu * (-0.5 * xdmu + 3.0 * mumxd2 / mu);
+        return true;
+    }
+
+    bool evaluateSFCNodePenalty(const int piece_idx,
+                                const Vector2d& pos,
+                                double& penalty,
+                                Vector2d& gradient) const {
+        penalty = 0.0;
+        gradient.setZero();
+        if (sfc_h_polytopes_.empty()) {
+            return false;
+        }
+
+        const int seg_idx = std::max(0, std::min(piece_idx, static_cast<int>(sfc_h_polytopes_.size()) - 1));
+        const auto& piece = sfc_h_polytopes_[seg_idx];
+        const double smooth = std::max(params_.sfc_smooth_factor, 1.0e-6);
+        for (const auto& half_space : piece) {
+            const double violation = half_space.normal.dot(pos) - half_space.offset;
+            double smoothed_cost = 0.0;
+            double smoothed_grad = 0.0;
+            if (smoothedL1(violation, smooth, smoothed_cost, smoothed_grad)) {
+                penalty += smoothed_cost;
+                gradient += smoothed_grad * half_space.normal;
+            }
+        }
+
+        return penalty > 0.0;
+    }
+
     bool buildSFCParameterization() {
-        sfc_point_polys_.clear();
+        sfc_h_polytopes_.clear();
+        sfc_v_polytopes_.clear();
+        sfc_v_poly_idx_.resize(0);
+        sfc_h_poly_idx_.resize(0);
+        sfc_piece_idx_.resize(0);
         sfc_spatial_dim_ = 0;
+        sfc_short_path_.resize(2, 0);
         sfc_initial_inner_points_.resize(2, 0);
+        sfc_initial_times_.resize(0);
 
         if (!(params_.use_sfc_parameterization || params_.use_corridor_parameterization) ||
-            !usesSFCConstraints(params_.constraint_mode) ||
-            piece_pos_ < 2 || !env_) {
+            !usesSFCConstraints(params_.constraint_mode) || !env_) {
             return false;
         }
 
@@ -595,39 +807,87 @@ private:
             return false;
         }
 
-        if (static_cast<int>(sfc->size()) != piece_pos_) {
+        const int poly_num = static_cast<int>(sfc->size());
+        if (poly_num < 1) {
             return false;
         }
 
-        sfc_point_polys_.reserve(piece_pos_ - 1);
         std::vector<std::vector<Vector2d>> overlap_vertices;
-        overlap_vertices.reserve(piece_pos_ - 1);
-        for (int i = 0; i < piece_pos_ - 1; ++i) {
-            CorridorPiece2D overlap = intersectPieces((*sfc)[i], (*sfc)[i + 1]);
-            std::vector<Vector2d> vertices = halfspacesToVertices(overlap);
+        overlap_vertices.reserve(std::max(0, poly_num - 1));
+        sfc_h_polytopes_.reserve(poly_num);
+        for (int i = 0; i < poly_num; ++i) {
+            sfc_h_polytopes_.push_back(normalizePiece((*sfc)[i]));
+        }
+        for (int i = 0; i < poly_num - 1; ++i) {
+            std::vector<Vector2d> vertices =
+                halfspacesToVertices(intersectPieces(sfc_h_polytopes_[i], sfc_h_polytopes_[i + 1]));
             if (vertices.size() < 3) {
-                vertices = halfspacesToVertices((*sfc)[i]);
-            }
-            if (vertices.size() < 3) {
-                sfc_point_polys_.clear();
-                sfc_spatial_dim_ = 0;
                 return false;
             }
-
             overlap_vertices.push_back(vertices);
-            sfc_point_polys_.push_back(buildVPolytope(vertices));
-            sfc_spatial_dim_ += sfc_point_polys_.back().cols();
         }
 
-        if (static_cast<int>(sfc_point_polys_.size()) != piece_pos_ - 1) {
+        if (!processSFC(sfc_h_polytopes_)) {
             return false;
         }
 
-        return buildShortestPathThroughPolytopes(init_pos_.col(0),
-                                                 end_pos_.col(0),
-                                                 *sfc,
-                                                 overlap_vertices,
-                                                 sfc_initial_inner_points_);
+        if (!buildShortestPathThroughPolytopes(init_pos_.col(0),
+                                               end_pos_.col(0),
+                                               sfc_h_polytopes_,
+                                               overlap_vertices,
+                                               sfc_short_path_)) {
+            return false;
+        }
+
+        allocatePiecesByLength(sfc_short_path_, params_.piece_len, sfc_piece_idx_);
+        if (sfc_piece_idx_.size() != poly_num) {
+            return false;
+        }
+
+        piece_pos_ = sfc_piece_idx_.sum();
+        if (piece_pos_ < 1) {
+            return false;
+        }
+
+        buildInitialFromPath(sfc_short_path_, sfc_piece_idx_, sfc_initial_inner_points_);
+        if (sfc_initial_inner_points_.cols() != piece_pos_ - 1) {
+            return false;
+        }
+
+        buildTimeAllocationFromPath(sfc_short_path_,
+                                    sfc_piece_idx_,
+                                    std::max(params_.max_v * 3.0, 1.0e-3),
+                                    sfc_initial_times_);
+        if (sfc_initial_times_.size() != piece_pos_) {
+            return false;
+        }
+        const double init_total_time = sfc_initial_times_.sum();
+        const double target_total_time = std::max(init_total_time, params_.total_time);
+        if (init_total_time > 1.0e-8 && target_total_time > init_total_time) {
+            sfc_initial_times_ *= target_total_time / init_total_time;
+        }
+
+        sfc_v_poly_idx_.resize(std::max(0, piece_pos_ - 1));
+        sfc_h_poly_idx_.resize(piece_pos_);
+        sfc_spatial_dim_ = 0;
+        for (int i = 0, point_idx = 0, piece_id = 0; i < poly_num; ++i) {
+            const int pieces = sfc_piece_idx_(i);
+            for (int j = 0; j < pieces; ++j, ++piece_id) {
+                if (j < pieces - 1) {
+                    sfc_v_poly_idx_(point_idx) = 2 * i;
+                    sfc_spatial_dim_ += sfc_v_polytopes_[2 * i].cols();
+                    point_idx += 1;
+                } else if (i < poly_num - 1) {
+                    sfc_v_poly_idx_(point_idx) = 2 * i + 1;
+                    sfc_spatial_dim_ += sfc_v_polytopes_[2 * i + 1].cols();
+                    point_idx += 1;
+                }
+                sfc_h_poly_idx_(piece_id) = i;
+            }
+        }
+
+        return sfc_v_poly_idx_.size() == piece_pos_ - 1 &&
+               sfc_h_poly_idx_.size() == piece_pos_;
     }
 
     bool buildCorridorParameterization() {
@@ -646,73 +906,37 @@ private:
         return optimizeSE2Traj(initPos, innerPtsPos, endPos, initTpos);
     }
 
-    int optimizeSE2Traj(const MatrixXd& initPos, const MatrixXd& innerPtsPos,
-                        const MatrixXd& endPos, const VectorXd& initTpos) {
-        in_opt_ = true;
-        piece_pos_ = innerPtsPos.cols() + 1;
-        init_pos_ = initPos;
-        end_pos_ = endPos;
-        use_sfc_parameterization_ = buildSFCParameterization();
-        use_corridor_parameterization_ = use_sfc_parameterization_;
+    int failOptimization(int result) {
+        in_opt_ = false;
+        last_opt_result_ = result;
+        last_opt_cost_ = 0.0;
+        return result;
+    }
 
-        dim_T = piece_pos_;
-        const int spatial_dim = use_sfc_parameterization_
-                                    ? sfc_spatial_dim_
-                                    : 2 * (piece_pos_ - 1);
-        int variable_num = spatial_dim + dim_T;
-
-        Eigen::VectorXd x;
-        x.resize(variable_num);
-
-        Eigen::Map<Eigen::VectorXd> tau(x.data(), dim_T);
-        MatrixXd Ppos = innerPtsPos;
-        if (use_sfc_parameterization_ &&
-            sfc_initial_inner_points_.cols() == piece_pos_ - 1) {
-            Ppos = sfc_initial_inner_points_;
-        }
-        if (use_sfc_parameterization_) {
-            VectorXd xi;
-            backwardP(Ppos, sfc_point_polys_, xi);
-            Eigen::Map<Eigen::VectorXd> xiMap(x.data() + dim_T, spatial_dim);
-            xiMap = xi;
-        } else {
-            Eigen::Map<Eigen::MatrixXd> PposMap(x.data() + dim_T, 2, piece_pos_ - 1);
-            PposMap = innerPtsPos;
-        }
-
-        Eigen::VectorXd Tpos;
-        if (initTpos.size() != piece_pos_) {
-            in_opt_ = false;
-            last_opt_result_ = lbfgs::LBFGSERR_INVALID_N;
-            last_opt_cost_ = 0.0;
-            return last_opt_result_;
-        }
-        Tpos = initTpos;
-        for (int i = 0; i < Tpos.size(); ++i) {
-            Tpos(i) = std::max(Tpos(i), 1.0e-3);
-        }
-        for (int i = 0; i < dim_T; ++i) {
-            tau(i) = logC2(Tpos(i));
-        }
-
-        generateTrajectory(initPos, endPos, Ppos, Tpos);
+    void printInitialTrajectorySummary() const {
         auto metrics = evaluateTrajectory();
         std::cout << "Initial Trajectory:" << std::endl;
         std::cout << "Max velocity: " << metrics.max_velocity << " m/s" << std::endl;
         std::cout << "Max acceleration: " << metrics.max_acceleration << " m/s^2" << std::endl;
         std::cout << "Min clearance: " << metrics.min_clearance << " m" << std::endl;
         std::cout << "Path deviation: " << metrics.path_deviation << " m" << std::endl;
+    }
 
-        lbfgs::lbfgs_parameter_t lbfgs_params;
+    void configureLBFGS(lbfgs::lbfgs_parameter_t& lbfgs_params) const {
         lbfgs_params.mem_size = params_.mem_size;
         lbfgs_params.past = params_.past;
         lbfgs_params.g_epsilon = params_.g_epsilon;
         lbfgs_params.min_step = params_.min_step;
         lbfgs_params.delta = params_.delta;
         lbfgs_params.max_iterations = params_.max_iter;
+    }
 
-        double final_cost;
-        int result = lbfgs::lbfgs_optimize(
+    int runLBFGSOptimization(Eigen::VectorXd& x) {
+        lbfgs::lbfgs_parameter_t lbfgs_params;
+        configureLBFGS(lbfgs_params);
+
+        double final_cost = 0.0;
+        const int result = lbfgs::lbfgs_optimize(
             x, final_cost,
             [](void* instance, const Eigen::VectorXd& x, Eigen::VectorXd& grad) {
                 return static_cast<TrajectoryOptimizer*>(instance)->costFunction(x, grad);
@@ -728,64 +952,241 @@ private:
         return result;
     }
 
+    int resolveSFCPieceIndex(int segment_idx, int segment_num) const {
+        if (use_sfc_parameterization_ && sfc_h_poly_idx_.size() == segment_num) {
+            return sfc_h_poly_idx_(segment_idx);
+        }
+        return segment_idx;
+    }
+
+    double getSFCWeight() const {
+        return params_.rho_sfc > 0.0 ? params_.rho_sfc : params_.rho_corridor;
+    }
+
+    int optimizeSE2Traj(const MatrixXd& initPos, const MatrixXd& innerPtsPos,
+                        const MatrixXd& endPos, const VectorXd& initTpos) {
+        in_opt_ = true;
+        piece_pos_ = innerPtsPos.cols() + 1;
+        init_pos_ = initPos;
+        end_pos_ = endPos;
+        use_sfc_parameterization_ = false;
+
+        switch (params_.constraint_mode) {
+            case SpatialConstraintMode::ESDF:
+                return optimizeSE2TrajESDF(initPos, innerPtsPos, endPos, initTpos);
+            case SpatialConstraintMode::SFC:
+            case SpatialConstraintMode::ESDFAndSFC:
+                use_sfc_parameterization_ = buildSFCParameterization();
+                if (!use_sfc_parameterization_) {
+                    return failOptimization(lbfgs::LBFGSERR_INVALID_N);
+                }
+                return optimizeSE2TrajSFC(initPos, innerPtsPos, endPos, initTpos);
+        }
+
+        return failOptimization(lbfgs::LBFGSERR_INVALID_N);
+    }
+
+    int optimizeSE2TrajESDF(const MatrixXd& initPos, const MatrixXd& innerPtsPos,
+                            const MatrixXd& endPos, const VectorXd& initTpos) {
+        dim_T = piece_pos_;
+        const int spatial_dim = 2 * (piece_pos_ - 1);
+        Eigen::VectorXd x(dim_T + spatial_dim);
+
+        Eigen::Map<Eigen::VectorXd> tau(x.data(), dim_T);
+        Eigen::Map<Eigen::MatrixXd> PposMap(x.data() + dim_T, 2, piece_pos_ - 1);
+        PposMap = innerPtsPos;
+
+        if (initTpos.size() != piece_pos_) {
+            return failOptimization(lbfgs::LBFGSERR_INVALID_N);
+        }
+
+        Eigen::VectorXd Tpos = initTpos;
+        for (int i = 0; i < Tpos.size(); ++i) {
+            Tpos(i) = std::max(Tpos(i), 1.0e-3);
+            tau(i) = logC2(Tpos(i));
+        }
+
+        generateTrajectory(initPos, endPos, innerPtsPos, Tpos);
+        printInitialTrajectorySummary();
+        return runLBFGSOptimization(x);
+    }
+
+    int optimizeSE2TrajSFC(const MatrixXd& initPos, const MatrixXd& innerPtsPos,
+                           const MatrixXd& endPos, const VectorXd& initTpos) {
+        dim_T = piece_pos_;
+        const int spatial_dim = sfc_spatial_dim_;
+        Eigen::VectorXd x(dim_T + spatial_dim);
+
+        Eigen::Map<Eigen::VectorXd> tau(x.data(), dim_T);
+        MatrixXd Ppos = innerPtsPos;
+        if (sfc_initial_inner_points_.cols() == piece_pos_ - 1) {
+            Ppos = sfc_initial_inner_points_;
+        }
+
+        VectorXd xi;
+        backwardP(Ppos, sfc_v_poly_idx_, sfc_v_polytopes_, xi);
+        Eigen::Map<Eigen::VectorXd> xiMap(x.data() + dim_T, spatial_dim);
+        xiMap = xi;
+
+        Eigen::VectorXd Tpos;
+        if (sfc_initial_times_.size() == piece_pos_) {
+            Tpos = sfc_initial_times_;
+        } else if (initTpos.size() == piece_pos_) {
+            Tpos = initTpos;
+        } else {
+            return failOptimization(lbfgs::LBFGSERR_INVALID_N);
+        }
+
+        for (int i = 0; i < Tpos.size(); ++i) {
+            Tpos(i) = std::max(Tpos(i), 1.0e-3);
+            tau(i) = logC2(Tpos(i));
+        }
+
+        generateTrajectory(initPos, endPos, Ppos, Tpos);
+        printInitialTrajectorySummary();
+        return runLBFGSOptimization(x);
+    }
+
+    using ConstraintCostFunction = void (TrajectoryOptimizer::*)(PPoly2D&, double&, Eigen::MatrixXd&, Eigen::VectorXd&);
+
     double costFunction(const Eigen::VectorXd& x, Eigen::VectorXd& grad) {
-        double cost = 0.0;
+        switch (params_.constraint_mode) {
+            case SpatialConstraintMode::ESDF:
+                return costFunctionESDF(x, grad);
+            case SpatialConstraintMode::SFC:
+                return costFunctionSFC(x, grad);
+            case SpatialConstraintMode::ESDFAndSFC:
+                return costFunctionHybrid(x, grad);
+        }
+
+        grad.setZero(x.size());
+        return 0.0;
+    }
+
+    double costFunctionESDF(const Eigen::VectorXd& x, Eigen::VectorXd& grad) {
+        return evaluateCostFromESDFVariables(x, grad,
+                                             &TrajectoryOptimizer::calculateConstraintCostGradESDF);
+    }
+
+    double costFunctionSFC(const Eigen::VectorXd& x, Eigen::VectorXd& grad) {
+        return evaluateCostFromSFCVariables(x, grad,
+                                            &TrajectoryOptimizer::calculateConstraintCostGradSFC);
+    }
+
+    double costFunctionHybrid(const Eigen::VectorXd& x, Eigen::VectorXd& grad) {
+        return evaluateCostFromSFCVariables(x, grad,
+                                            &TrajectoryOptimizer::calculateConstraintCostGradHybrid);
+    }
+
+    double evaluateCostFromESDFVariables(const Eigen::VectorXd& x,
+                                         Eigen::VectorXd& grad,
+                                         ConstraintCostFunction constraint_fn) {
+        grad.setZero(x.size());
 
         Eigen::Map<const Eigen::VectorXd> tau(x.data(), dim_T);
         Eigen::Map<Eigen::VectorXd> gradTau(grad.data(), dim_T);
-        MatrixXd Ppos(2, piece_pos_ - 1);
+        Eigen::Map<const Eigen::MatrixXd> PposMap(x.data() + dim_T, 2, piece_pos_ - 1);
+        const MatrixXd Ppos = PposMap;
 
-        Eigen::VectorXd Tpos;
-        Tpos.resize(piece_pos_);
+        Eigen::VectorXd Tpos(piece_pos_);
         calTfromTau(tau, Tpos);
-        if (use_sfc_parameterization_) {
-            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dim_T, sfc_spatial_dim_);
-            forwardP(xi, sfc_point_polys_, Ppos);
-        } else {
-            Eigen::Map<const Eigen::MatrixXd> PposMap(x.data() + dim_T, 2, piece_pos_ - 1);
-            Ppos = PposMap;
-        }
         generateTrajectory(init_pos_, end_pos_, Ppos, Tpos);
 
         double constrain_cost = 0.0;
         Eigen::MatrixXd gdCpos_constrain;
         Eigen::VectorXd gdTpos_constrain;
-        calculateConstraintCostGrad(trajectory_, constrain_cost, gdCpos_constrain, gdTpos_constrain);
-        
+        (this->*constraint_fn)(trajectory_, constrain_cost, gdCpos_constrain, gdTpos_constrain);
+
         Eigen::MatrixXd gradPpos_constrain;
         Eigen::VectorXd gradTpos_constrain;
         calGradCTtoQT(gdCpos_constrain, gdTpos_constrain, gradPpos_constrain, gradTpos_constrain);
-        
-        double energy = quintic_spline_.getEnergy();
-        double energy_cost = params_.rho_energy * energy;
-        
-        QuinticSpline2D::MatrixType gradP_energy = quintic_spline_.getEnergyGradInnerPoints();
-        Eigen::VectorXd gradT_energy = quintic_spline_.getEnergyGradTimes();
-        
-        MatrixXd gradPposTotal = gradPpos_constrain + params_.rho_energy * gradP_energy.transpose();
+
+        const double energy = quintic_spline_.getEnergy();
+        const double energy_cost = params_.rho_energy * energy;
+        const QuinticSpline2D::MatrixType gradP_energy = quintic_spline_.getEnergyGradInnerPoints();
+        const Eigen::VectorXd gradT_energy = quintic_spline_.getEnergyGradTimes();
+
+        const MatrixXd gradPposTotal = gradPpos_constrain + params_.rho_energy * gradP_energy.transpose();
         Eigen::VectorXd gradTpos_total = gradTpos_constrain + params_.rho_energy * gradT_energy;
 
-        double tau_cost = params_.rho_T * Tpos.sum();
+        const double tau_cost = params_.rho_T * Tpos.sum();
         gradTpos_total.array() += params_.rho_T;
         Eigen::VectorXd grad_tau(dim_T);
         calGradtfromT(tau, gradTpos_total, grad_tau);
         gradTau = grad_tau;
 
-        cost = constrain_cost + energy_cost + tau_cost;
-        if (use_sfc_parameterization_) {
-            Eigen::Map<const Eigen::VectorXd> xi(x.data() + dim_T, sfc_spatial_dim_);
-            Eigen::Map<Eigen::VectorXd> gradXi(grad.data() + dim_T, sfc_spatial_dim_);
-            backwardGradP(xi, sfc_point_polys_, gradPposTotal, gradXi);
-            normRestrictionLayer(xi, sfc_point_polys_, cost, gradXi);
-        } else {
-            Eigen::Map<Eigen::MatrixXd> gradPpos(grad.data() + dim_T, 2, piece_pos_ - 1);
-            gradPpos = gradPposTotal;
-        }
+        Eigen::Map<Eigen::MatrixXd> gradPpos(grad.data() + dim_T, 2, piece_pos_ - 1);
+        gradPpos = gradPposTotal;
 
-        return cost;
+        return constrain_cost + energy_cost + tau_cost;
+    }
+
+    double evaluateCostFromSFCVariables(const Eigen::VectorXd& x,
+                                        Eigen::VectorXd& grad,
+                                        ConstraintCostFunction constraint_fn) {
+        grad.setZero(x.size());
+
+        Eigen::Map<const Eigen::VectorXd> tau(x.data(), dim_T);
+        Eigen::Map<Eigen::VectorXd> gradTau(grad.data(), dim_T);
+        Eigen::Map<const Eigen::VectorXd> xi(x.data() + dim_T, sfc_spatial_dim_);
+        MatrixXd Ppos(2, piece_pos_ - 1);
+        forwardP(xi, sfc_v_poly_idx_, sfc_v_polytopes_, Ppos);
+
+        Eigen::VectorXd Tpos(piece_pos_);
+        calTfromTau(tau, Tpos);
+        generateTrajectory(init_pos_, end_pos_, Ppos, Tpos);
+
+        double constrain_cost = 0.0;
+        Eigen::MatrixXd gdCpos_constrain;
+        Eigen::VectorXd gdTpos_constrain;
+        (this->*constraint_fn)(trajectory_, constrain_cost, gdCpos_constrain, gdTpos_constrain);
+
+        Eigen::MatrixXd gradPpos_constrain;
+        Eigen::VectorXd gradTpos_constrain;
+        calGradCTtoQT(gdCpos_constrain, gdTpos_constrain, gradPpos_constrain, gradTpos_constrain);
+
+        const double energy = quintic_spline_.getEnergy();
+        const double energy_cost = params_.rho_energy * energy;
+        const QuinticSpline2D::MatrixType gradP_energy = quintic_spline_.getEnergyGradInnerPoints();
+        const Eigen::VectorXd gradT_energy = quintic_spline_.getEnergyGradTimes();
+
+        const MatrixXd gradPposTotal = gradPpos_constrain + params_.rho_energy * gradP_energy.transpose();
+        Eigen::VectorXd gradTpos_total = gradTpos_constrain + params_.rho_energy * gradT_energy;
+
+        const double tau_cost = params_.rho_T * Tpos.sum();
+        gradTpos_total.array() += params_.rho_T;
+        Eigen::VectorXd grad_tau(dim_T);
+        calGradtfromT(tau, gradTpos_total, grad_tau);
+        gradTau = grad_tau;
+
+        double total_cost = constrain_cost + energy_cost + tau_cost;
+        Eigen::Map<Eigen::VectorXd> gradXi(grad.data() + dim_T, sfc_spatial_dim_);
+        backwardGradP(xi, sfc_v_poly_idx_, sfc_v_polytopes_, gradPposTotal, gradXi);
+        normRestrictionLayer(xi, sfc_v_poly_idx_, sfc_v_polytopes_, total_cost, gradXi);
+
+        return total_cost;
     }
 
     void calculateConstraintCostGrad(
+        PPoly2D& traj,
+        double& cost,
+        Eigen::MatrixXd& gdCpos,
+        Eigen::VectorXd& gdTpos)
+    {
+        switch (params_.constraint_mode) {
+            case SpatialConstraintMode::ESDF:
+                calculateConstraintCostGradESDF(traj, cost, gdCpos, gdTpos);
+                return;
+            case SpatialConstraintMode::SFC:
+                calculateConstraintCostGradSFC(traj, cost, gdCpos, gdTpos);
+                return;
+            case SpatialConstraintMode::ESDFAndSFC:
+                calculateConstraintCostGradHybrid(traj, cost, gdCpos, gdTpos);
+                return;
+        }
+    }
+
+    void calculateConstraintCostGradESDF(
         PPoly2D& traj,
         double& cost,
         Eigen::MatrixXd& gdCpos,
@@ -795,8 +1196,7 @@ private:
         double v_cost = 0.0;
         double a_cost = 0.0;
         double occ_cost = 0.0;
-        double sfc_cost = 0.0;
-        
+
         const int N = traj.getNumSegments();
         gdCpos.resize(6 * N, 2);
         gdCpos.setZero();
@@ -812,14 +1212,13 @@ private:
         Eigen::Vector2d grad_v = Eigen::Vector2d::Zero();
         Eigen::Vector2d grad_a = Eigen::Vector2d::Zero();
         Eigen::Vector2d grad_sdf = Eigen::Vector2d::Zero();
-        Eigen::Vector2d grad_sfc = Eigen::Vector2d::Zero();
         Eigen::Matrix<double, 6, 1> beta0, beta1, beta2, beta3;
         double s1, s2, s3, s4, s5;
         double step, alpha, omg;
 
         for (int i = 0; i < N; ++i) {
             const Eigen::Matrix<double, 6, 2>& c = coeffs.block<6, 2>(i * 6, 0);
-            step = (breaks[i+1] - breaks[i]) / params_.int_K;
+            step = (breaks[i + 1] - breaks[i]) / params_.int_K;
             s1 = 0.0;
 
             for (int j = 0; j <= params_.int_K; ++j) {
@@ -845,38 +1244,33 @@ private:
 
                 omg = (j == 0 || j == params_.int_K) ? 0.5 : 1.0;
 
-                // 1. Velocity constraint
-                double vxy_snorm = vel.squaredNorm();
-                double vViola = vxy_snorm - params_.max_v * params_.max_v;
-                if (vViola > 0) {
-                    grad_v += params_.rho_v * 6 * vViola * vViola * vel;
-                    double cost_v = params_.rho_v * vViola * vViola * vViola;
+                const double vxy_snorm = vel.squaredNorm();
+                const double vViola = vxy_snorm - params_.max_v * params_.max_v;
+                if (vViola > 0.0) {
+                    grad_v += params_.rho_v * 6.0 * vViola * vViola * vel;
+                    const double cost_v = params_.rho_v * vViola * vViola * vViola;
                     cost += cost_v * omg * step;
                     v_cost += cost_v * omg * step;
                     grad_time += omg * (cost_v / params_.int_K + step * alpha * grad_v.dot(acc));
                 }
 
-                // 2. Acceleration constraint
-                double axy_snorm = acc.squaredNorm();
-                double aViola = axy_snorm - params_.max_a * params_.max_a;
-                if (aViola > 0) {
-                    grad_a += params_.rho_a * 6 * aViola * aViola * acc;
-                    double cost_a = params_.rho_a * aViola * aViola * aViola;
+                const double axy_snorm = acc.squaredNorm();
+                const double aViola = axy_snorm - params_.max_a * params_.max_a;
+                if (aViola > 0.0) {
+                    grad_a += params_.rho_a * 6.0 * aViola * aViola * acc;
+                    const double cost_a = params_.rho_a * aViola * aViola * aViola;
                     cost += cost_a * omg * step;
                     a_cost += cost_a * omg * step;
                     grad_time += omg * (cost_a / params_.int_K + step * alpha * grad_a.dot(jerk));
                 }
 
-                // 3. Collision constraint
                 if (env_) {
-                    double sdf_value;
-                    if (usesESDFConstraints(params_.constraint_mode) &&
-                        env_->getDistanceAndGradient(pos, sdf_value, grad_sdf)) {
-                        double cViola = params_.safe_threshold - sdf_value;
-                        if (cViola > 0 && sdf_value < 5) {
-                            double penalty;
-                            Eigen::Vector2d grad_pc;
-                            
+                    double sdf_value = 0.0;
+                    if (env_->getDistanceAndGradient(pos, sdf_value, grad_sdf)) {
+                        const double cViola = params_.safe_threshold - sdf_value;
+                        if (cViola > 0.0 && sdf_value < 5.0) {
+                            double penalty = 0.0;
+                            Eigen::Vector2d grad_pc = Eigen::Vector2d::Zero();
                             if (cViola < 0.1) {
                                 penalty = cViola * cViola;
                                 grad_pc = -2.0 * cViola * grad_sdf;
@@ -884,10 +1278,236 @@ private:
                                 penalty = cViola;
                                 grad_pc = -grad_sdf;
                             }
-                            
-                            double cost_c = params_.rho_collision * penalty;
-                            Eigen::Vector2d grad_pc_scaled = params_.rho_collision * grad_pc;
-                            
+
+                            const double cost_c = params_.rho_collision * penalty;
+                            const Eigen::Vector2d grad_pc_scaled = params_.rho_collision * grad_pc;
+                            cost += cost_c * omg * step;
+                            occ_cost += cost_c * omg * step;
+                            grad_time += omg * (cost_c / params_.int_K + step * alpha * grad_pc_scaled.dot(vel));
+                            grad_p += grad_pc_scaled;
+                        }
+                    }
+                }
+
+                gdCpos.block<6, 2>(i * 6, 0) +=
+                    (beta0 * grad_p.transpose() +
+                     beta1 * grad_v.transpose() +
+                     beta2 * grad_a.transpose()) * omg * step;
+                gdTpos(i) += grad_time;
+                s1 += step;
+            }
+        }
+
+        std::cout << "Cost breakdown - Vel: " << v_cost
+                  << ", Acc: " << a_cost
+                  << ", Coll: " << occ_cost
+                  << ", SFC: 0" << std::endl;
+    }
+
+    void calculateConstraintCostGradSFC(
+        PPoly2D& traj,
+        double& cost,
+        Eigen::MatrixXd& gdCpos,
+        Eigen::VectorXd& gdTpos)
+    {
+        cost = 0.0;
+        double v_cost = 0.0;
+        double a_cost = 0.0;
+        double sfc_cost = 0.0;
+        const double sfc_weight = getSFCWeight();
+
+        const int N = traj.getNumSegments();
+        gdCpos.resize(6 * N, 2);
+        gdCpos.setZero();
+        gdTpos.resize(N);
+        gdTpos.setZero();
+
+        const auto& breaks = traj.getBreakpoints();
+        const MatrixXd& coeffs = traj.getCoefficients();
+
+        Eigen::Vector2d pos, vel, acc, jerk;
+        double grad_time = 0.0;
+        Eigen::Vector2d grad_p = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_v = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_a = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_sfc = Eigen::Vector2d::Zero();
+        Eigen::Matrix<double, 6, 1> beta0, beta1, beta2, beta3;
+        double s1, s2, s3, s4, s5;
+        double step, alpha, omg;
+
+        for (int i = 0; i < N; ++i) {
+            const Eigen::Matrix<double, 6, 2>& c = coeffs.block<6, 2>(i * 6, 0);
+            step = (breaks[i + 1] - breaks[i]) / params_.int_K;
+            s1 = 0.0;
+
+            for (int j = 0; j <= params_.int_K; ++j) {
+                alpha = 1.0 / params_.int_K * j;
+                grad_p.setZero();
+                grad_v.setZero();
+                grad_a.setZero();
+                grad_sfc.setZero();
+                grad_time = 0.0;
+
+                s2 = s1 * s1;
+                s3 = s2 * s1;
+                s4 = s2 * s2;
+                s5 = s4 * s1;
+                beta0 << 1.0, s1, s2, s3, s4, s5;
+                beta1 << 0.0, 1.0, 2.0 * s1, 3.0 * s2, 4.0 * s3, 5.0 * s4;
+                beta2 << 0.0, 0.0, 2.0, 6.0 * s1, 12.0 * s2, 20.0 * s3;
+                beta3 << 0.0, 0.0, 0.0, 6.0, 24.0 * s1, 60.0 * s2;
+                pos = c.transpose() * beta0;
+                vel = c.transpose() * beta1;
+                acc = c.transpose() * beta2;
+                jerk = c.transpose() * beta3;
+
+                omg = (j == 0 || j == params_.int_K) ? 0.5 : 1.0;
+
+                const double vxy_snorm = vel.squaredNorm();
+                const double vViola = vxy_snorm - params_.max_v * params_.max_v;
+                if (vViola > 0.0) {
+                    grad_v += params_.rho_v * 6.0 * vViola * vViola * vel;
+                    const double cost_v = params_.rho_v * vViola * vViola * vViola;
+                    cost += cost_v * omg * step;
+                    v_cost += cost_v * omg * step;
+                    grad_time += omg * (cost_v / params_.int_K + step * alpha * grad_v.dot(acc));
+                }
+
+                const double axy_snorm = acc.squaredNorm();
+                const double aViola = axy_snorm - params_.max_a * params_.max_a;
+                if (aViola > 0.0) {
+                    grad_a += params_.rho_a * 6.0 * aViola * aViola * acc;
+                    const double cost_a = params_.rho_a * aViola * aViola * aViola;
+                    cost += cost_a * omg * step;
+                    a_cost += cost_a * omg * step;
+                    grad_time += omg * (cost_a / params_.int_K + step * alpha * grad_a.dot(jerk));
+                }
+
+                double sfc_penalty = 0.0;
+                const int piece_idx = resolveSFCPieceIndex(i, N);
+                if (evaluateSFCNodePenalty(piece_idx, pos, sfc_penalty, grad_sfc)) {
+                    const double cost_sc = sfc_weight * sfc_penalty;
+                    const Eigen::Vector2d grad_sc = sfc_weight * grad_sfc;
+                    cost += cost_sc * omg * step;
+                    sfc_cost += cost_sc * omg * step;
+                    grad_time += omg * (cost_sc / params_.int_K + step * alpha * grad_sc.dot(vel));
+                    grad_p += grad_sc;
+                }
+
+                gdCpos.block<6, 2>(i * 6, 0) +=
+                    (beta0 * grad_p.transpose() +
+                     beta1 * grad_v.transpose() +
+                     beta2 * grad_a.transpose()) * omg * step;
+                gdTpos(i) += grad_time;
+                s1 += step;
+            }
+        }
+
+        std::cout << "Cost breakdown - Vel: " << v_cost
+                  << ", Acc: " << a_cost
+                  << ", Coll: 0"
+                  << ", SFC: " << sfc_cost << std::endl;
+    }
+
+    void calculateConstraintCostGradHybrid(
+        PPoly2D& traj,
+        double& cost,
+        Eigen::MatrixXd& gdCpos,
+        Eigen::VectorXd& gdTpos)
+    {
+        cost = 0.0;
+        double v_cost = 0.0;
+        double a_cost = 0.0;
+        double occ_cost = 0.0;
+        double sfc_cost = 0.0;
+        const double sfc_weight = getSFCWeight();
+
+        const int N = traj.getNumSegments();
+        gdCpos.resize(6 * N, 2);
+        gdCpos.setZero();
+        gdTpos.resize(N);
+        gdTpos.setZero();
+
+        const auto& breaks = traj.getBreakpoints();
+        const MatrixXd& coeffs = traj.getCoefficients();
+
+        Eigen::Vector2d pos, vel, acc, jerk;
+        double grad_time = 0.0;
+        Eigen::Vector2d grad_p = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_v = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_a = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_sdf = Eigen::Vector2d::Zero();
+        Eigen::Vector2d grad_sfc = Eigen::Vector2d::Zero();
+        Eigen::Matrix<double, 6, 1> beta0, beta1, beta2, beta3;
+        double s1, s2, s3, s4, s5;
+        double step, alpha, omg;
+
+        for (int i = 0; i < N; ++i) {
+            const Eigen::Matrix<double, 6, 2>& c = coeffs.block<6, 2>(i * 6, 0);
+            step = (breaks[i + 1] - breaks[i]) / params_.int_K;
+            s1 = 0.0;
+
+            for (int j = 0; j <= params_.int_K; ++j) {
+                alpha = 1.0 / params_.int_K * j;
+                grad_p.setZero();
+                grad_v.setZero();
+                grad_a.setZero();
+                grad_sdf.setZero();
+                grad_sfc.setZero();
+                grad_time = 0.0;
+
+                s2 = s1 * s1;
+                s3 = s2 * s1;
+                s4 = s2 * s2;
+                s5 = s4 * s1;
+                beta0 << 1.0, s1, s2, s3, s4, s5;
+                beta1 << 0.0, 1.0, 2.0 * s1, 3.0 * s2, 4.0 * s3, 5.0 * s4;
+                beta2 << 0.0, 0.0, 2.0, 6.0 * s1, 12.0 * s2, 20.0 * s3;
+                beta3 << 0.0, 0.0, 0.0, 6.0, 24.0 * s1, 60.0 * s2;
+                pos = c.transpose() * beta0;
+                vel = c.transpose() * beta1;
+                acc = c.transpose() * beta2;
+                jerk = c.transpose() * beta3;
+
+                omg = (j == 0 || j == params_.int_K) ? 0.5 : 1.0;
+
+                const double vxy_snorm = vel.squaredNorm();
+                const double vViola = vxy_snorm - params_.max_v * params_.max_v;
+                if (vViola > 0.0) {
+                    grad_v += params_.rho_v * 6.0 * vViola * vViola * vel;
+                    const double cost_v = params_.rho_v * vViola * vViola * vViola;
+                    cost += cost_v * omg * step;
+                    v_cost += cost_v * omg * step;
+                    grad_time += omg * (cost_v / params_.int_K + step * alpha * grad_v.dot(acc));
+                }
+
+                const double axy_snorm = acc.squaredNorm();
+                const double aViola = axy_snorm - params_.max_a * params_.max_a;
+                if (aViola > 0.0) {
+                    grad_a += params_.rho_a * 6.0 * aViola * aViola * acc;
+                    const double cost_a = params_.rho_a * aViola * aViola * aViola;
+                    cost += cost_a * omg * step;
+                    a_cost += cost_a * omg * step;
+                    grad_time += omg * (cost_a / params_.int_K + step * alpha * grad_a.dot(jerk));
+                }
+
+                if (env_) {
+                    double sdf_value = 0.0;
+                    if (env_->getDistanceAndGradient(pos, sdf_value, grad_sdf)) {
+                        const double cViola = params_.safe_threshold - sdf_value;
+                        if (cViola > 0.0 && sdf_value < 5.0) {
+                            double penalty = 0.0;
+                            Eigen::Vector2d grad_pc = Eigen::Vector2d::Zero();
+                            if (cViola < 0.1) {
+                                penalty = cViola * cViola;
+                                grad_pc = -2.0 * cViola * grad_sdf;
+                            } else {
+                                penalty = cViola;
+                                grad_pc = -grad_sdf;
+                            }
+
+                            const double cost_c = params_.rho_collision * penalty;
+                            const Eigen::Vector2d grad_pc_scaled = params_.rho_collision * grad_pc;
                             cost += cost_c * omg * step;
                             occ_cost += cost_c * omg * step;
                             grad_time += omg * (cost_c / params_.int_K + step * alpha * grad_pc_scaled.dot(vel));
@@ -895,13 +1515,11 @@ private:
                         }
                     }
 
-                    double sfc_viola;
-                    if (usesSFCConstraints(params_.constraint_mode) &&
-                        env_->getSFCViolation(i, pos, sfc_viola, grad_sfc) &&
-                        sfc_viola > 0.0) {
-                        const double sfc_weight = params_.rho_sfc > 0.0 ? params_.rho_sfc : params_.rho_corridor;
-                        const double cost_sc = sfc_weight * sfc_viola * sfc_viola;
-                        const Eigen::Vector2d grad_sc = sfc_weight * 2.0 * sfc_viola * grad_sfc;
+                    double sfc_penalty = 0.0;
+                    const int piece_idx = resolveSFCPieceIndex(i, N);
+                    if (evaluateSFCNodePenalty(piece_idx, pos, sfc_penalty, grad_sfc)) {
+                        const double cost_sc = sfc_weight * sfc_penalty;
+                        const Eigen::Vector2d grad_sc = sfc_weight * grad_sfc;
                         cost += cost_sc * omg * step;
                         sfc_cost += cost_sc * omg * step;
                         grad_time += omg * (cost_sc / params_.int_K + step * alpha * grad_sc.dot(vel));
@@ -914,7 +1532,6 @@ private:
                      beta1 * grad_v.transpose() +
                      beta2 * grad_a.transpose()) * omg * step;
                 gdTpos(i) += grad_time;
-                
                 s1 += step;
             }
         }
@@ -1049,10 +1666,15 @@ private:
     int last_opt_result_ = lbfgs::LBFGSERR_UNKNOWNERROR;
     double last_opt_cost_ = 0.0;
     bool use_sfc_parameterization_ = false;
-    bool use_corridor_parameterization_ = false;
-    std::vector<CorridorPolytope2D> sfc_point_polys_;
+    std::vector<CorridorPiece2D> sfc_h_polytopes_;
+    std::vector<CorridorPolytope2D> sfc_v_polytopes_;
+    Eigen::VectorXi sfc_v_poly_idx_;
+    Eigen::VectorXi sfc_h_poly_idx_;
+    Eigen::VectorXi sfc_piece_idx_;
     int sfc_spatial_dim_ = 0;
+    MatrixXd sfc_short_path_;
     MatrixXd sfc_initial_inner_points_;
+    VectorXd sfc_initial_times_;
 };
 
 } // namespace TrajOpt

@@ -20,6 +20,43 @@ namespace {
 
 using Polygon2D = std::vector<Eigen::Vector2d>;
 
+struct PipelineConfig {
+    Eigen::Vector2d start = Eigen::Vector2d(-8.7, 1.7);
+    Eigen::Vector2d goal = Eigen::Vector2d(8.2, 0.0);
+
+    double map_width = 20.0;
+    double map_height = 12.0;
+    double map_resolution = 0.08;
+
+    double anchor_spacing = 1.6;
+    double nominal_speed = 0.9;
+
+    double astar_inflate_radius = 0.22;
+    double astar_max_velocity = 2.0;
+    double astar_max_acceleration = 1.0;
+    double astar_time_resolution = 0.2;
+    int astar_min_trajectory_num = 12;
+    int astar_max_iterations = 6000;
+
+    perception_tools::FootprintSpec footprint{0.7, 0.4, 0.0};
+    perception_tools::BoundingBoxSpec bbox{2.4 *1.3, 1.4 *1.3, 1.5*1.3 };
+    perception_tools::GeneratorOptions generator_options{12, 0.005, true, 5, 4.5};
+
+    double init_velocity_scale = 0.3;
+
+    double rho_v = 50000.0;
+    double rho_a = 50000.0;
+    double rho_sfc = 200000.0;
+    double rho_collision = 100000.0;
+    double rho_energy = 200.0;
+    double rho_T = 20.0;
+    double max_v = 2.0;
+    double max_a = 2.0;
+    int int_K = 24;
+
+    int render_scale = 34;
+};
+
 Polygon2D makeRotatedRectangle(const Eigen::Vector2d& center,
                                double length,
                                double width,
@@ -45,9 +82,10 @@ std::vector<Polygon2D> buildGcopterLikeObstacles()
         makeRotatedRectangle(Eigen::Vector2d(-7.8,  3.7), 4.2, 1.2,  0.12),
         makeRotatedRectangle(Eigen::Vector2d(-4.7,  2.1), 3.7, 1.0,  1.28),
         makeRotatedRectangle(Eigen::Vector2d(-2.0,  4.6), 3.0, 1.1,  0.64),
-        makeRotatedRectangle(Eigen::Vector2d( 3.7,  4.5), 7.0, 1.1, -0.10),
+        makeRotatedRectangle(Eigen::Vector2d( 3.7,  2.5), 7.0, 1.1, -0.10),
         makeRotatedRectangle(Eigen::Vector2d(-9.1, -3.8), 4.4, 1.0,  1.45),
         makeRotatedRectangle(Eigen::Vector2d(-3.9, -2.6), 6.5, 1.2,  0.05),
+        makeRotatedRectangle(Eigen::Vector2d( 4.9, -1.6), 6.5, 1.2,  0.05),
         makeRotatedRectangle(Eigen::Vector2d( 0.8, -4.1), 3.6, 1.1,  1.22)
     };
 }
@@ -204,9 +242,9 @@ cv::Mat renderScene(const grid_map::GridMap& map,
                     const std::vector<Eigen::Vector2d>& anchors,
                     const std::vector<perception_tools::CorridorResult>& sfcs,
                     const Eigen::Vector2d& start,
-                    const Eigen::Vector2d& goal)
+                    const Eigen::Vector2d& goal,
+                    int scale)
 {
-    const int scale = 34;
     const int width_px = static_cast<int>(std::round(map.getMapSize().x() * scale));
     const int height_px = static_cast<int>(std::round(map.getMapSize().y() * scale));
     cv::Mat img(height_px, width_px, CV_8UC3, cv::Scalar(250, 250, 250));
@@ -266,33 +304,36 @@ cv::Mat renderScene(const grid_map::GridMap& map,
 
 int main(int argc, char** argv)
 {
+    const PipelineConfig cfg;
     const TrajOpt::SpatialConstraintMode mode = parseMode(argc, argv);
     const std::string mode_name =
         mode == TrajOpt::SpatialConstraintMode::ESDF ? "esdf" :
         mode == TrajOpt::SpatialConstraintMode::ESDFAndSFC ? "hybrid" : "sfc";
 
+    // 1. Build the synthetic GCOPTER-like scene on a 2D occupancy grid.
     grid_map::GridMap map;
-    map.init(20.0, 12.0, 0.08);
+    map.init(cfg.map_width, cfg.map_height, cfg.map_resolution);
 
     const auto obstacles = buildGcopterLikeObstacles();
     map.setMap(rasterizePolygons(map, obstacles));
 
-    const Eigen::Vector2d start(-8.7, 1.7);
-    const Eigen::Vector2d goal(8.2, 0.0);
+    const Eigen::Vector2d& start = cfg.start;
+    const Eigen::Vector2d& goal = cfg.goal;
 
-    path_planning::AStar astar(map, 0.22);
-    astar.setMaxVelocity(2.0);
-    astar.setMaxAcceleration(1.0);
-    astar.setTimeResolution(0.2);
-    astar.setMinTrajectoryNumber(12);
+    // 2. Use A* as the front-end to produce a collision-free seed path.
+    path_planning::AStar astar(map, cfg.astar_inflate_radius);
+    astar.setMaxVelocity(cfg.astar_max_velocity);
+    astar.setMaxAcceleration(cfg.astar_max_acceleration);
+    astar.setTimeResolution(cfg.astar_time_resolution);
+    astar.setMinTrajectoryNumber(cfg.astar_min_trajectory_num);
 
-    const auto astar_traj = astar.planWithPostProcessing(start, goal, 6000);
+    const auto astar_traj = astar.planWithPostProcessing(start, goal, cfg.astar_max_iterations);
     if (astar_traj.optimized_path.empty()) {
         std::cerr << "A* failed to find a seed path in the GCOPTER-like scene.\n";
         return -1;
     }
 
-    const auto anchor_indices = sampleAnchorIndices(astar_traj.optimized_path, 1.6);
+    const auto anchor_indices = sampleAnchorIndices(astar_traj.optimized_path, cfg.anchor_spacing);
     if (anchor_indices.size() < 4) {
         std::cerr << "Anchor sampling produced too few intervals.\n";
         return -1;
@@ -304,24 +345,8 @@ int main(int argc, char** argv)
         anchors.push_back(astar_traj.optimized_path[idx]);
     }
 
+    // 3. Build one SFC polytope for each path interval using the local heading and path window.
     perception_tools::CorridorGenerator generator;
-    perception_tools::FootprintSpec footprint;
-    footprint.length = 0.7;
-    footprint.width = 0.4;
-    footprint.offset_x = 0.0;
-
-    perception_tools::BoundingBoxSpec bbox;
-    bbox.ahead = 2.4*5;
-    bbox.behind = 1.4*5;
-    bbox.side = 1.5*5;
-
-    perception_tools::GeneratorOptions options;
-    options.max_iter = 12;
-    options.convergence_rho = 0.005;
-    options.use_path_seed = true;
-    options.path_seed_count = 5;
-    options.path_lookahead = 4.5;
-
     std::vector<perception_tools::CorridorResult> sfcs;
     sfcs.reserve(anchor_indices.size() - 1);
     for (size_t i = 0; i + 1 < anchor_indices.size(); ++i) {
@@ -334,9 +359,9 @@ int main(int argc, char** argv)
         auto sfc = generator.generate(map,
                                       astar_traj.optimized_path[center_idx],
                                       yaw,
-                                      footprint,
-                                      bbox,
-                                      options,
+                                      cfg.footprint,
+                                      cfg.bbox,
+                                      cfg.generator_options,
                                       local_path);
         if (sfc.vertices.size() < 3) {
             std::cerr << "FIRI failed on interval " << i << ".\n";
@@ -351,6 +376,7 @@ int main(int argc, char** argv)
         sfc_pieces.push_back(toSFCPiece(sfc));
     }
 
+    // 4. Select the backend environment according to the requested constraint mode.
     auto map_ptr = std::make_shared<grid_map::GridMap>(map);
     auto distance_env = std::make_shared<TrajOpt::GridMapEnv>(map_ptr);
     auto sfc_env = std::make_shared<TrajOpt::SafeSFCEnv>(sfc_pieces);
@@ -367,9 +393,9 @@ int main(int argc, char** argv)
     Eigen::Matrix2d end_state;
     init_state.col(0) = start;
     end_state.col(0) = goal;
-    init_state.col(1) = (astar_traj.optimized_path[1] - astar_traj.optimized_path[0]).normalized() * 0.3;
+    init_state.col(1) = (astar_traj.optimized_path[1] - astar_traj.optimized_path[0]).normalized() * cfg.init_velocity_scale;
     end_state.col(1) =
-        (astar_traj.optimized_path.back() - astar_traj.optimized_path[astar_traj.optimized_path.size() - 2]).normalized() * 0.3;
+        (astar_traj.optimized_path.back() - astar_traj.optimized_path[astar_traj.optimized_path.size() - 2]).normalized() * cfg.init_velocity_scale;
 
     const int piece_num = static_cast<int>(sfc_pieces.size());
     Eigen::MatrixXd inner_pts(2, piece_num - 1);
@@ -377,23 +403,24 @@ int main(int argc, char** argv)
         inner_pts.col(i) = anchors[i + 1];
     }
 
-    const Eigen::VectorXd init_T = buildInitialTimes(anchors, 0.9);
+    const Eigen::VectorXd init_T = buildInitialTimes(anchors, cfg.nominal_speed);
 
+    // 5. Configure and run the trajectory optimizer.
     TrajOpt::TrajectoryParams params;
-    params.rho_v = 50000.0;
-    params.rho_a = 50000.0;
-    params.rho_sfc = 200000.0;
+    params.rho_v = cfg.rho_v;
+    params.rho_a = cfg.rho_a;
+    params.rho_sfc = cfg.rho_sfc;
     params.rho_collision = 0.0;
-    params.rho_energy = 200.0;
-    params.rho_T = 20.0;
-    params.max_v = 2.0;
-    params.max_a = 2.0;
-    params.int_K = 24;
+    params.rho_energy = cfg.rho_energy;
+    params.rho_T = cfg.rho_T;
+    params.max_v = cfg.max_v;
+    params.max_a = cfg.max_a;
+    params.int_K = cfg.int_K;
     params.constraint_mode = mode;
     params.use_sfc_parameterization = (mode != TrajOpt::SpatialConstraintMode::ESDF);
     params.use_corridor_parameterization = false;
     if (mode != TrajOpt::SpatialConstraintMode::SFC) {
-        params.rho_collision = 100000.0;
+        params.rho_collision = cfg.rho_collision;
     }
 
     TrajOpt::TrajectoryOptimizer optimizer(params);
@@ -404,9 +431,10 @@ int main(int argc, char** argv)
         return -1;
     }
 
+    // 6. Render the seed path, generated SFCs and optimized trajectory for inspection.
     const auto optimized_path = optimizer.sampleTrajectory(0.1);
     const cv::Mat viz = renderScene(map, obstacles, astar_traj.optimized_path,
-                                    optimized_path, anchors, sfcs, start, goal);
+                                    optimized_path, anchors, sfcs, start, goal, cfg.render_scale);
     const std::string output_path = "gcopter_style_pipeline_" + mode_name + ".png";
     cv::imwrite(output_path, viz);
 
